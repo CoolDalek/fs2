@@ -28,18 +28,13 @@ import cats.syntax.all._
 
 import java.nio.channels.FileChannel
 import java.nio.file.{Files => JFiles, Path => JPath, _}
-import java.nio.file.attribute.{
-  BasicFileAttributeView,
-  BasicFileAttributes => JBasicFileAttributes,
-  PosixFileAttributes => JPosixFileAttributes,
-  PosixFilePermissions
-}
+import java.nio.file.attribute.{BasicFileAttributeView, PosixFilePermissions, BasicFileAttributes => JBasicFileAttributes, PosixFileAttributes => JPosixFileAttributes}
 import java.security.Principal
 import java.util.stream.{Stream => JStream}
-
 import scala.concurrent.duration._
-
 import fs2.io.CollectionCompat._
+
+import java.nio.ByteBuffer
 import java.nio.file.attribute.FileTime
 
 private[file] trait FilesPlatform[F[_]] extends DeprecatedFilesApi[F] { self: Files[F] =>
@@ -381,6 +376,34 @@ private[file] trait FilesCompanionPlatform {
         .resource(createWatcher)
         .evalTap(_.watch(path, types, modifiers))
         .flatMap(_.events(pollTimeout))
+
+    override def readAll(path: Path, chunkSize: Int, flags: Flags): Stream[F, Byte] =
+      Stream.fromAutoCloseable {
+        Sync[F].blocking {
+          JFiles.newInputStream(
+            path.toNioPath,
+            flags.addIfAbsent(Flag.Read).value.map(_.option): _*
+          )
+        }
+      }.flatMap { is =>
+
+        def read: F[Option[Chunk[Byte]]] =
+          Sync[F].blocking {
+            val buffer = new Array[Byte](chunkSize)
+            val read = is.read(buffer)
+            if (read < 0) None
+            else Some(Chunk.array(buffer, 0, read))
+          }
+
+        def pull: Pull[F, Byte, Unit] =
+          Pull.eval(read).flatMap {
+            case None => Pull.done
+            case Some(chunk) => Pull.output(chunk) >> pull
+          }
+
+        pull.stream
+      }
+
   }
 
   private class DelegatingBasicFileAttributes(attr: JBasicFileAttributes)
